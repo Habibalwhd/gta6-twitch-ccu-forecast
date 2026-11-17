@@ -2,15 +2,22 @@
 """Forecast GTA VI's launch-day Twitch viewers hour by hour (make.fun
 gta6-twitch-ccu-forecast-01), Python 3.13, standard library only.
 
-Method: for every comparable past launch, take its release-day curve as a
-log-ratio to its own hour-1 print, lr[h] = ln(v_h) - ln(v_1), hours 2..24.
-Weight each comparable by how much its launch resembles this case --
-console-only midnight-rolling launches first (every case in this contest
-is one: GTA VI on PS5/Xbox Series, and all four practice launches are
-console-only too), then closeness in log hour-1 size -- and read the
-forecast quantiles off the weighted distribution of log-ratios per hour,
-applied to this case's hour-1 print. A small widening factor keeps the
-90% band honest. No network, no randomness: two runs are byte-identical.
+Method (v2): for every comparable past launch, take its release-day curve
+as a log-ratio to its own hour-1 print, lr[h] = ln(v_h) - ln(v_1), hours
+2..24. The curve's shape is governed by launch size: the log-ratio at
+each hour is a strong, roughly linear function of ln(hour-1 viewers)
+(slope about -0.9 late in the day; big launches stay nearly flat, small
+ones explode). So per hour, fit a size-weighted local-linear trend of
+log-ratio on ln(hour-1) around the case's own size and read the median
+off it -- this corrects the boundary bias of a plain weighted quantile,
+which at the big-launch edge can only see smaller neighbours and so
+overstates the rise. The quantiles come from the weighted distribution
+of the trend's residuals, widened by a small factor to keep the 90%
+band honest. Comparables are weighted towards console-only midnight-
+rolling launches (the target's own kind) and away from early-access-
+contaminated ones, whose release-day curve already peaked before the
+day and so understates the rise. No network, no randomness: two runs
+are byte-identical.
 """
 
 import json
@@ -31,9 +38,18 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 # country by country, on consoles only -- so those are the traits a
 # comparable is weighted towards.
 CONSOLE_BONUS = 2.0       # comparable has no PC in its platforms
-ROLLING_BONUS = 1.5       # unlock text says midnight local / rolling
+ROLLING_BONUS = 2.0       # unlock text says midnight local / rolling;
+                          # the target is a rolling launch, so its own
+                          # kind is weighted heaviest
 SIMULT_BONUS = 0.7        # unlock text says simultaneous / single global
-LOGH1_SIGMA = 0.9         # Gaussian width on ln(hour-1 viewers)
+LOGH1_SIGMA = 2.0         # Gaussian width on ln(hour-1 viewers); wider
+                          # than v1's 0.9 because the local-linear trend
+                          # below carries the size effect, so the kernel
+                          # only has to localise the residuals
+TIER_EA_WEIGHT = 0.25     # a comparable whose unlock notes flag it
+                          # early-access-contaminated already peaked before
+                          # its release day, so its day curve is flatter
+                          # than a clean launch's; down-weight it
 WEIGHT_FLOOR = 0.0        # tuned to zero: any floor lets the tiny-hour-1
                           # explosive curves (log-ratios up to +7) leak
                           # weight into every forecast
@@ -57,6 +73,14 @@ def _unlock_kind(unlock):
     if "simultaneous" in text or "single global" in text or "global unlock" in text:
         return "simultaneous"
     return "other"
+
+
+def _tier(unlock):
+    """'ea' when the unlock notes flag the comparable early-access-
+    contaminated, else 'ok'. Early-access launches already peaked before
+    their release day, so their release-day curve understates the rise a
+    clean launch shows."""
+    return "ea" if "early-access-contaminated" in (unlock or "") else "ok"
 
 
 def _log_ratio_curve(comp):
@@ -89,6 +113,8 @@ def _weight(comp, log_h1):
         weight *= ROLLING_BONUS
     elif kind == "simultaneous":
         weight *= SIMULT_BONUS
+    if _tier(comp.get("unlock")) == "ea":
+        weight *= TIER_EA_WEIGHT
     curve_h1 = comp["_h1"]
     weight *= math.exp(-0.5 * ((math.log(curve_h1) - log_h1) / LOGH1_SIGMA) ** 2)
     return weight + WEIGHT_FLOOR
@@ -131,12 +157,29 @@ def forecast_case(case):
     rows = []
     for idx, hour in enumerate(range(2, 25)):
         if curves:
-            pairs = [(_w[1][idx], _weight(_w[0], log_h1)) for _w in curves]
-            median = _weighted_quantile(pairs, 0.5)
+            # Local-linear size trend: fit a weighted line of this hour's
+            # log-ratio on ln(hour-1 viewers) around the case's own size
+            # and read the median off it, then take the quantiles from
+            # the weighted distribution of the trend's residuals.
+            xs = [math.log(_w[0]["_h1"]) for _w in curves]
+            ys = [_w[1][idx] for _w in curves]
+            ws = [_weight(_w[0], log_h1) for _w in curves]
+            total_w = sum(ws)
+            mean_x = sum(w * x for w, x in zip(ws, xs)) / total_w
+            mean_y = sum(w * y for w, y in zip(ws, ys)) / total_w
+            sxy = sum(w * (x - mean_x) * (y - mean_y)
+                    for w, x, y in zip(ws, xs, ys))
+            sxx = sum(w * (x - mean_x) ** 2 for w, x in zip(ws, xs))
+            slope = sxy / sxx if sxx > 0 else 0.0
+            intercept = mean_y - slope * mean_x
+            median = intercept + slope * log_h1
+            residuals = [(_w[1][idx] - (intercept + slope * math.log(_w[0]["_h1"])), w)
+                         for _w, w in zip(curves, ws)]
+            median_resid = _weighted_quantile(residuals, 0.5)
             quantiles = []
             for tau in LEVELS:
-                q = _weighted_quantile(pairs, tau)
-                quantiles.append(median + WIDEN * (q - median))
+                q = _weighted_quantile(residuals, tau)
+                quantiles.append(median + WIDEN * (q - median_resid))
         else:
             quantiles = [0.0] * 5
         values = []
